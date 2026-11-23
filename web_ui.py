@@ -36,7 +36,7 @@ AUTO_LAYOUT = "auto"
 AUTO_FOCUS = ""
 AUTO_FX_ENABLED = True
 MAX_STORED_JOBS = 40
-AUTO_CLEANUP_SEC = 1800  # Remove server job output 30m after completion to save disk
+AUTO_CLEANUP_SEC = 1800
 
 JOBS_LOCK = threading.Lock()
 JOBS: dict[str, dict] = {}
@@ -79,10 +79,10 @@ def _new_job(job_id: str, out_folder: Path, video_folder: str) -> dict:
     return {
         "job_id": job_id,
         "running": True,
-        "phase": "generating",  # idle | generating | completed | error
+        "phase": "generating",
         "logs": [],
         "clips_created": 0,
-        "clips": [],  # [{"name": "01_clip.mp4", "rel_path": "StreamClipper/...", "size_mb": 4.2, "url": "/api/download/..."}]
+        "clips": [],
         "zip_url": f"/api/download-zip/{job_id}",
         "zip_name": f"StreamClipper_{video_folder}.zip",
         "video_folder": video_folder,
@@ -324,6 +324,7 @@ def run_clip_worker(job_id: str, form: dict) -> None:
         run_env["STREAMCLIPS_AUTO_FX"] = "1" if AUTO_FX_ENABLED else "0"
         run_env["STREAMCLIPS_OUT_DIR"] = str(out_folder)
         run_env["STREAMCLIPS_HOME"] = str(cache_home)
+        run_env["YT_DLP_EXTRACTOR_ARGS"] = "youtube:player-client=android,mweb,web"
         run_env["PYTHONIOENCODING"] = "utf-8"
         run_env["PYTHONUTF8"] = "1"
 
@@ -1297,7 +1298,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <input id="sourceInput" type="text" placeholder="https://www.youtube.com/watch?v=..." />
     </div>
 
-    <input id="videoFiles" type="file" accept=".mp4,.mkv,.mov,.avi,.webm,.m4v,.wmv,video/*" multiple style="display:none;" onchange="handleFileSelection('video')" />
+    <input id="videoFiles" type="file" accept=".mp4,.mkv,.mov,.avi,.webm,.m4v,.wmv,.3gp,video/*" multiple style="display:none;" onchange="handleFileSelection('video')" />
     <input id="musicFile" type="file" accept=".mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,audio/*" style="display:none;" onchange="handleFileSelection('music')" />
 
     <div class="upload-launch-row">
@@ -1455,7 +1456,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <script>
 const STORAGE_KEY = "streamclipper_user_gemini_api_key";
 const JOB_STORAGE_KEY = "streamclipper_active_job_id";
-const VIDEO_EXTS = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv"];
+const VIDEO_EXTS = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".3gp"];
 const MUSIC_EXTS = [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"];
 
 let muteProfanity = true;
@@ -1492,7 +1493,7 @@ function hasAllowedExt(fileName, exts) {
 }
 
 function formatSize(bytes) {
-  if (!bytes || bytes <= 0) return "0 B";
+  if (!bytes || bytes <= 0) return "Mobile file";
   const mb = bytes / (1024 * 1024);
   if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
   if (mb >= 1) return `${mb.toFixed(1)} MB`;
@@ -1512,13 +1513,14 @@ function handleFileSelection(kind) {
   if (kind === "video") {
     const files = Array.from(document.getElementById("videoFiles").files || []);
     videoEntries = files.map((file) => {
-      const valid = hasAllowedExt(file.name, VIDEO_EXTS) && file.size > 0;
+      const mime = (file.type || "").toLowerCase();
+      const valid = hasAllowedExt(file.name, VIDEO_EXTS) || mime.startsWith("video/");
       return {
         file,
-        name: file.name,
+        name: file.name || "uploaded_video.mp4",
         sizeLabel: formatSize(file.size),
         state: valid ? "ready" : "bad",
-        label: valid ? `Ready (${formatSize(file.size)})` : (file.size <= 0 ? "Empty file" : "Unsupported"),
+        label: valid ? `Ready (${formatSize(file.size)})` : "Unsupported format",
       };
     });
   } else {
@@ -1526,13 +1528,14 @@ function handleFileSelection(kind) {
     if (!file) {
       musicEntry = null;
     } else {
-      const valid = hasAllowedExt(file.name, MUSIC_EXTS) && file.size > 0;
+      const mime = (file.type || "").toLowerCase();
+      const valid = hasAllowedExt(file.name, MUSIC_EXTS) || mime.startsWith("audio/");
       musicEntry = {
         file,
-        name: file.name,
+        name: file.name || "background_music.mp3",
         sizeLabel: formatSize(file.size),
         state: valid ? "ready" : "bad",
-        label: valid ? `Ready (${formatSize(file.size)})` : (file.size <= 0 ? "Empty file" : "Unsupported"),
+        label: valid ? `Ready (${formatSize(file.size)})` : "Unsupported format",
       };
     }
   }
@@ -1615,7 +1618,7 @@ function renderMediaState() {
     summary.textContent = "Paste a link or upload video file(s)";
     closedBadge.textContent = "";
   } else if (badVideos.length > 0 || (musicEntry && musicEntry.state === "bad")) {
-    summary.textContent = "Check highlighted file format/size before generating";
+    summary.textContent = "Check highlighted file format before generating";
     closedBadge.textContent = !barOpen ? "File check needed" : "";
   } else {
     const parts = [`${validVideos.length} video(s)`];
@@ -1827,15 +1830,15 @@ async function startPipeline() {
   if (videoEntries.length > 0) {
     if (validVideos.length === 0 || (musicEntry && musicEntry.state === "bad")) {
       startBtn.disabled = false;
-      alert("Please remove or replace any unsupported/empty file before generating clips.");
+      alert("Please remove or replace any unsupported file before generating clips.");
       return;
     }
 
     const prevText = startBtn.textContent;
     startBtn.textContent = "Uploading...";
     const form = new FormData();
-    for (const item of validVideos) form.append("videos", item.file);
-    if (musicEntry) form.append("music", musicEntry.file);
+    for (const item of validVideos) form.append("videos", item.file, item.name || "uploaded_video.mp4");
+    if (musicEntry) form.append("music", musicEntry.file, musicEntry.name || "background_music.mp3");
     form.append("api_key", apiKey);
     form.append("num_clips", document.getElementById("numClipsInput").value);
     form.append("min_sec", document.getElementById("minSecInput").value);
@@ -2081,7 +2084,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/upload":
             length = int(self.headers.get("Content-Length", "0"))
-            max_upload = 2 * 1024 * 1024 * 1024  # 2 GB cap per request
+            max_upload = 2 * 1024 * 1024 * 1024
             if length <= 0 or length > max_upload:
                 self._send_json(400, {"error": "Upload is empty or exceeds the 2 GB limit."})
                 return
@@ -2122,18 +2125,16 @@ class Handler(BaseHTTPRequestHandler):
                         safe_filename = Path(filename.replace("\\", "/")).name
                         suffix = Path(safe_filename).suffix.lower()
                         if field_name == "videos":
-                            allowed = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv"}
-                            if suffix not in allowed:
-                                continue
-                            destination = temp_folder / (uuid.uuid4().hex + suffix)
+                            allowed = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".3gp"}
+                            ext = suffix if suffix in allowed else ".mp4"
+                            destination = temp_folder / (uuid.uuid4().hex + ext)
                             destination.write_bytes(payload)
                             video_paths.append(str(destination))
-                            uploaded_video_names.append(safe_filename)
+                            uploaded_video_names.append(Path(safe_filename).stem or "uploaded_video")
                         elif field_name == "music":
                             allowed = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
-                            if suffix not in allowed:
-                                continue
-                            destination = temp_folder / ("background_music" + suffix)
+                            ext = suffix if suffix in allowed else ".mp3"
+                            destination = temp_folder / ("background_music" + ext)
                             destination.write_bytes(payload)
                             music_path = str(destination)
                     elif field_name:
@@ -2145,7 +2146,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if not video_paths:
                     shutil.rmtree(temp_folder, ignore_errors=True)
-                    self._send_json(400, {"error": "No supported video files were selected."})
+                    self._send_json(400, {"error": "No video files were selected."})
                     return
                 if int(fields.get("min_sec", 20)) <= 0 or int(fields.get("max_sec", 60)) < int(fields.get("min_sec", 20)):
                     shutil.rmtree(temp_folder, ignore_errors=True)

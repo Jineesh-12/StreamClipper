@@ -1,11 +1,14 @@
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import zipfile
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,14 +42,50 @@ JOBS_LOCK = threading.Lock()
 JOBS: dict[str, dict] = {}
 
 
-def _new_job(job_id: str, out_folder: Path) -> dict:
+def _sanitize_folder_name(raw_name: str, fallback: str = "Video_Clips") -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", (raw_name or "").strip())
+    cleaned = re.sub(r"\s+", "_", cleaned).strip("._ ")
+    if not cleaned:
+        cleaned = fallback
+    return cleaned[:80]
+
+
+def _infer_video_folder_name(source: str, uploaded_names: list[str] | None = None) -> str:
+    if uploaded_names:
+        first_stem = Path(uploaded_names[0]).stem
+        return _sanitize_folder_name(first_stem, "Uploaded_Video")
+
+    src = (source or "").strip()
+    if not src:
+        return "StreamClipper_Video"
+
+    parsed = urlparse(src)
+    if parsed.scheme in ("http", "https"):
+        qs = parse_qs(parsed.query)
+        if "v" in qs and qs["v"]:
+            return _sanitize_folder_name(f"YouTube_{qs['v'][0]}", "YouTube_Video")
+        parts = [p for p in parsed.path.split("/") if p]
+        if parts:
+            last = parts[-1]
+            if last in ("watch", "shorts", "live", "embed") and len(parts) >= 2:
+                return _sanitize_folder_name(f"{parts[-2]}_{parts[-1]}", "Web_Video")
+            return _sanitize_folder_name(Path(last).stem, "Web_Video")
+        return _sanitize_folder_name(parsed.netloc, "Web_Video")
+
+    return _sanitize_folder_name(Path(src).stem, "Local_Video")
+
+
+def _new_job(job_id: str, out_folder: Path, video_folder: str) -> dict:
     return {
         "job_id": job_id,
         "running": True,
         "phase": "generating",  # idle | generating | completed | error
         "logs": [],
         "clips_created": 0,
-        "clips": [],  # [{"name": "01_clip.mp4", "size_mb": 4.2, "url": "/api/download/..."}]
+        "clips": [],  # [{"name": "01_clip.mp4", "rel_path": "StreamClipper/...", "size_mb": 4.2, "url": "/api/download/..."}]
+        "zip_url": f"/api/download-zip/{job_id}",
+        "zip_name": f"StreamClipper_{video_folder}.zip",
+        "video_folder": video_folder,
         "current_step": "Starting...",
         "progress_pct": 5,
         "output_folder": str(out_folder),
@@ -56,9 +95,9 @@ def _new_job(job_id: str, out_folder: Path) -> dict:
     }
 
 
-def _register_job(job_id: str, out_folder: Path) -> None:
+def _register_job(job_id: str, out_folder: Path, video_folder: str) -> None:
     with JOBS_LOCK:
-        JOBS[job_id] = _new_job(job_id, out_folder)
+        JOBS[job_id] = _new_job(job_id, out_folder, video_folder)
         if len(JOBS) > MAX_STORED_JOBS:
             oldest_ids = sorted(
                 JOBS.keys(),
@@ -92,23 +131,43 @@ def set_job_status(job_id: str, **kwargs) -> None:
         job.update(kwargs)
 
 
-def _refresh_job_clips(job_id: str, out_folder: Path) -> list[dict]:
+def _organize_and_refresh_clips(job_id: str, out_folder: Path) -> list[dict]:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id) or {}
+        video_folder = _sanitize_folder_name(job.get("video_folder", "StreamClipper_Video"))
+
+    target_dir = out_folder / "StreamClipper" / video_folder
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    mp4s = [
+        p for p in out_folder.rglob("*.mp4")
+        if p.is_file() and not p.name.endswith("_music_temp.mp4")
+    ]
+    for src_mp4 in mp4s:
+        dest_mp4 = target_dir / src_mp4.name
+        if src_mp4.resolve() != dest_mp4.resolve():
+            shutil.move(str(src_mp4), str(dest_mp4))
+
     clip_items: list[dict] = []
-    if out_folder.is_dir():
-        mp4s = sorted(
-            p for p in out_folder.rglob("*.mp4")
-            if p.is_file() and not p.name.endswith("_music_temp.mp4")
-        )
-        for p in mp4s:
-            rel_name = p.relative_to(out_folder).as_posix()
-            size_mb = round(p.stat().st_size / (1024 * 1024), 2)
-            clip_items.append({
-                "name": p.name,
-                "rel_path": rel_name,
-                "size_mb": size_mb,
-                "url": f"/api/download/{job_id}/{rel_name}",
-            })
-    set_job_status(job_id, clips=clip_items, clips_created=len(clip_items))
+    for p in sorted(target_dir.glob("*.mp4")):
+        if not p.is_file():
+            continue
+        rel_name = p.relative_to(out_folder).as_posix()
+        size_mb = round(p.stat().st_size / (1024 * 1024), 2)
+        clip_items.append({
+            "name": p.name,
+            "rel_path": rel_name,
+            "size_mb": size_mb,
+            "url": f"/api/download/{job_id}/{rel_name}",
+        })
+
+    set_job_status(
+        job_id,
+        clips=clip_items,
+        clips_created=len(clip_items),
+        zip_url=f"/api/download-zip/{job_id}" if clip_items else "",
+        zip_name=f"StreamClipper_{video_folder}.zip",
+    )
     return clip_items
 
 
@@ -121,6 +180,7 @@ def _schedule_cleanup(job_id: str, out_folder: Path, delay_sec: int = AUTO_CLEAN
                 return
             job["cleaned_up"] = True
             job["clips"] = []
+            job["zip_url"] = ""
         if out_folder.exists() and out_folder != BASE_OUT_DIR:
             shutil.rmtree(out_folder, ignore_errors=True)
 
@@ -137,6 +197,8 @@ def _get_job_snapshot(job_id: str | None) -> dict:
                 "logs": [],
                 "clips_created": 0,
                 "clips": [],
+                "zip_url": "",
+                "zip_name": "StreamClipper_Clips.zip",
                 "current_step": "Idle",
                 "progress_pct": 0,
                 "output_folder": str(BASE_OUT_DIR),
@@ -293,14 +355,14 @@ def run_clip_worker(job_id: str, form: dict) -> None:
             elif "picking" in low or "picked " in low:
                 set_job_status(job_id, current_step="Selecting moments...", progress_pct=72)
             elif "clip " in low and "saved " in low:
-                _refresh_job_clips(job_id, out_folder)
+                _organize_and_refresh_clips(job_id, out_folder)
                 set_job_status(job_id, current_step="Rendering clips...", progress_pct=88)
 
         rc = proc.wait()
-        clips = _refresh_job_clips(job_id, out_folder)
+        clips = _organize_and_refresh_clips(job_id, out_folder)
 
         if rc == 0:
-            append_log(job_id, f"Done: {len(clips)} clip(s) ready to download.")
+            append_log(job_id, f"Done: {len(clips)} clip(s) ready in StreamClipper folder.")
             set_job_status(
                 job_id,
                 running=False,
@@ -369,9 +431,9 @@ def run_upload_worker(
             log=lambda msg: append_log(job_id, msg),
             status=lambda **kw: set_job_status(job_id, **kw),
         )
-        clips = _refresh_job_clips(job_id, out_folder)
+        clips = _organize_and_refresh_clips(job_id, out_folder)
         final_count = len(clips) if clips else count
-        append_log(job_id, f"Complete: {final_count} clip(s) ready to download.")
+        append_log(job_id, f"Complete: {final_count} clip(s) ready in StreamClipper folder.")
         set_job_status(
             job_id,
             running=False,
@@ -1713,7 +1775,7 @@ function updateBadge(phase, running) {
   }
 }
 
-function renderClips(clips, cleanedUp) {
+function renderClips(clips, cleanedUp, zipUrl, zipName) {
   const wrap = document.getElementById("clipsList");
   if (!clips || !clips.length) {
     wrap.innerHTML = cleanedUp
@@ -1721,7 +1783,21 @@ function renderClips(clips, cleanedUp) {
       : "";
     return;
   }
-  wrap.innerHTML = clips.map((c) => `
+
+  let html = "";
+  if (zipUrl) {
+    html += `
+      <div class="clip-row">
+        <div class="clip-meta">
+          <span class="clip-title">${escapeHtml(zipName || "StreamClipper_Clips.zip")}</span>
+          <span class="clip-sub">Extracts into StreamClipper folder on your device</span>
+        </div>
+        <a class="btn" href="${escapeHtml(zipUrl)}" download="${escapeHtml(zipName || "StreamClipper_Clips.zip")}">Download Folder (.zip)</a>
+      </div>
+    `;
+  }
+
+  html += clips.map((c) => `
     <div class="clip-row">
       <div class="clip-meta">
         <span class="clip-title" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>
@@ -1730,6 +1806,8 @@ function renderClips(clips, cleanedUp) {
       <a class="btn" href="${escapeHtml(c.url)}" download="${escapeHtml(c.name)}">Download</a>
     </div>
   `).join("");
+
+  wrap.innerHTML = html;
 }
 
 async function startPipeline() {
@@ -1833,7 +1911,7 @@ async function pollStatus() {
     document.getElementById("jobIdVal").textContent = s.job_id || "None";
     document.getElementById("progFill").style.width = `${s.progress_pct ?? 0}%`;
 
-    renderClips(s.clips || [], !!s.cleaned_up);
+    renderClips(s.clips || [], !!s.cleaned_up, s.zip_url || "", s.zip_name || "StreamClipper_Clips.zip");
 
     const logBox = document.getElementById("logBox");
     if (Date.now() - localClearedAt > 1500) {
@@ -1867,6 +1945,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_zip_download(self, job_id: str) -> None:
+        clean_id = Path(job_id).name
+        if clean_id != job_id or not clean_id:
+            self._send_json(400, {"error": "Invalid job ID"})
+            return
+
+        job_root = (BASE_OUT_DIR / "jobs" / clean_id).resolve()
+        bundle_root = (job_root / "StreamClipper").resolve()
+        if not bundle_root.is_dir():
+            self._send_json(404, {"error": "Clips folder not found or expired"})
+            return
+
+        files = [p for p in bundle_root.rglob("*") if p.is_file()]
+        if not files:
+            self._send_json(404, {"error": "No clip files available to zip"})
+            return
+
+        with JOBS_LOCK:
+            job = JOBS.get(clean_id) or {}
+            zip_name = _sanitize_folder_name(
+                Path(job.get("zip_name", "StreamClipper_Clips.zip")).stem,
+                "StreamClipper_Clips",
+            ) + ".zip"
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for fpath in sorted(files):
+                arcname = Path("StreamClipper") / fpath.relative_to(bundle_root)
+                zf.write(fpath, arcname.as_posix())
+        raw_zip = buf.getvalue()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(raw_zip)))
+        self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
+        self.end_headers()
+        self.wfile.write(raw_zip)
 
     def _serve_clip_download(self, job_id: str, rel_path: str) -> None:
         clean_id = Path(job_id).name
@@ -1944,6 +2060,12 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             jid = (qs.get("job_id") or [""])[0].strip() or None
             self._send_json(200, _get_job_snapshot(jid))
+        elif parsed.path.startswith("/api/download-zip/"):
+            job_id = parsed.path[len("/api/download-zip/"):].strip("/")
+            if not job_id or "/" in job_id:
+                self._send_json(400, {"error": "Invalid zip download path"})
+                return
+            self._serve_zip_download(job_id)
         elif parsed.path.startswith("/api/download/"):
             rest = parsed.path[len("/api/download/"):]
             job_id, sep, rel_path = rest.partition("/")
@@ -1989,6 +2111,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 fields: dict[str, str] = {}
                 video_paths: list[str] = []
+                uploaded_video_names: list[str] = []
                 music_path: str | None = None
 
                 for part in message.iter_parts():
@@ -2005,6 +2128,7 @@ class Handler(BaseHTTPRequestHandler):
                             destination = temp_folder / (uuid.uuid4().hex + suffix)
                             destination.write_bytes(payload)
                             video_paths.append(str(destination))
+                            uploaded_video_names.append(safe_filename)
                         elif field_name == "music":
                             allowed = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
                             if suffix not in allowed:
@@ -2028,8 +2152,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(400, {"error": "Clip duration settings are invalid."})
                     return
 
+                video_folder = _infer_video_folder_name("", uploaded_video_names)
                 job_out = BASE_OUT_DIR / "jobs" / job_id
-                _register_job(job_id, job_out)
+                _register_job(job_id, job_out, video_folder)
                 threading.Thread(
                     target=run_upload_worker,
                     args=(job_id, fields, video_paths, music_path, temp_folder),
@@ -2058,8 +2183,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "Please set your Google API Key in Settings first."})
                 return
             job_id = uuid.uuid4().hex[:12]
+            video_folder = _infer_video_folder_name(str(data.get("source", "")))
             job_out = BASE_OUT_DIR / "jobs" / job_id
-            _register_job(job_id, job_out)
+            _register_job(job_id, job_out, video_folder)
             threading.Thread(target=run_clip_worker, args=(job_id, data), daemon=True).start()
             self._send_json(200, {"started": True, "job_id": job_id})
         else:

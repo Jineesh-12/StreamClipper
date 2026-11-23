@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python -m venv /root/.streamclips/venv && \
     /root/.streamclips/venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /root/.streamclips/venv/bin/pip install --no-cache-dir \
+    /root/.streamclips/venv/bin/pip install --no-cache-dir --upgrade \
       faster-whisper \
       opencv-python-headless \
       pillow \

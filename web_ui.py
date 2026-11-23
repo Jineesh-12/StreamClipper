@@ -10,52 +10,149 @@ from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
 PROJECT_DIR = Path(__file__).resolve().parent
 SCRIPT_PATH = PROJECT_DIR / "scripts" / "streamclips.py"
-DEFAULT_CLIPS_DIR = Path.home() / "StreamClips"
 
-VENV_PYTHON = Path.home() / ".streamclips" / "venv" / "Scripts" / "python.exe"
+_default_out = (
+    "/tmp/StreamClips"
+    if os.name != "nt" and Path("/tmp").exists()
+    else str(Path.home() / "StreamClips")
+)
+BASE_OUT_DIR = Path(os.environ.get("STREAMCLIPS_OUT_DIR", _default_out)).expanduser().resolve()
+BASE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+VENV_PYTHON = Path.home() / ".streamclips" / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 PYTHON_EXE = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 
-# Automatic studio settings (hidden from the web UI)
 AUTO_TOPIC = "Highlights"
 AUTO_LAYOUT = "auto"
 AUTO_FOCUS = ""
 AUTO_FX_ENABLED = True
+MAX_STORED_JOBS = 40
+AUTO_CLEANUP_SEC = 1800  # Remove server job output 30m after completion to save disk
 
-STATE_LOCK = threading.Lock()
-JOB_STATE = {
-    "running": False,
-    "phase": "idle",  # idle | generating | completed | error
-    "logs": [],
-    "clips_created": 0,
-    "current_step": "Idle",
-    "progress_pct": 0,
-    "output_folder": str(DEFAULT_CLIPS_DIR),
-}
+JOBS_LOCK = threading.Lock()
+JOBS: dict[str, dict] = {}
 
 
-def append_log(message: str) -> None:
+def _new_job(job_id: str, out_folder: Path) -> dict:
+    return {
+        "job_id": job_id,
+        "running": True,
+        "phase": "generating",  # idle | generating | completed | error
+        "logs": [],
+        "clips_created": 0,
+        "clips": [],  # [{"name": "01_clip.mp4", "size_mb": 4.2, "url": "/api/download/..."}]
+        "current_step": "Starting...",
+        "progress_pct": 5,
+        "output_folder": str(out_folder),
+        "created_at": time.time(),
+        "finished_at": None,
+        "cleaned_up": False,
+    }
+
+
+def _register_job(job_id: str, out_folder: Path) -> None:
+    with JOBS_LOCK:
+        JOBS[job_id] = _new_job(job_id, out_folder)
+        if len(JOBS) > MAX_STORED_JOBS:
+            oldest_ids = sorted(
+                JOBS.keys(),
+                key=lambda k: JOBS[k].get("created_at", 0.0),
+            )[: len(JOBS) - MAX_STORED_JOBS]
+            for old_id in oldest_ids:
+                if not JOBS[old_id].get("running"):
+                    old_dir = Path(JOBS[old_id].get("output_folder", ""))
+                    if old_dir.exists() and old_dir != BASE_OUT_DIR:
+                        shutil.rmtree(old_dir, ignore_errors=True)
+                    JOBS.pop(old_id, None)
+
+
+def append_log(job_id: str, message: str) -> None:
     stamp = time.strftime("%H:%M:%S")
     line = f"[{stamp}] {message}"
-    with STATE_LOCK:
-        JOB_STATE["logs"].append(line)
-        if len(JOB_STATE["logs"]) > 600:
-            JOB_STATE["logs"] = JOB_STATE["logs"][-600:]
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job["logs"].append(line)
+        if len(job["logs"]) > 600:
+            job["logs"] = job["logs"][-600:]
 
 
-def set_status(**kwargs) -> None:
-    with STATE_LOCK:
-        JOB_STATE.update(kwargs)
+def set_job_status(job_id: str, **kwargs) -> None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.update(kwargs)
 
 
-def _same_drive_cache_dir(out_folder: Path) -> Path:
-    anchor = out_folder.anchor or str(out_folder.root or "/")
-    cache_dir = Path(anchor) / "StreamClipsDownloads"
+def _refresh_job_clips(job_id: str, out_folder: Path) -> list[dict]:
+    clip_items: list[dict] = []
+    if out_folder.is_dir():
+        mp4s = sorted(
+            p for p in out_folder.rglob("*.mp4")
+            if p.is_file() and not p.name.endswith("_music_temp.mp4")
+        )
+        for p in mp4s:
+            rel_name = p.relative_to(out_folder).as_posix()
+            size_mb = round(p.stat().st_size / (1024 * 1024), 2)
+            clip_items.append({
+                "name": p.name,
+                "rel_path": rel_name,
+                "size_mb": size_mb,
+                "url": f"/api/download/{job_id}/{rel_name}",
+            })
+    set_job_status(job_id, clips=clip_items, clips_created=len(clip_items))
+    return clip_items
+
+
+def _schedule_cleanup(job_id: str, out_folder: Path, delay_sec: int = AUTO_CLEANUP_SEC) -> None:
+    def _cleanup_later() -> None:
+        time.sleep(delay_sec)
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job or job.get("running"):
+                return
+            job["cleaned_up"] = True
+            job["clips"] = []
+        if out_folder.exists() and out_folder != BASE_OUT_DIR:
+            shutil.rmtree(out_folder, ignore_errors=True)
+
+    threading.Thread(target=_cleanup_later, daemon=True).start()
+
+
+def _get_job_snapshot(job_id: str | None) -> dict:
+    with JOBS_LOCK:
+        if not JOBS:
+            return {
+                "job_id": "",
+                "running": False,
+                "phase": "idle",
+                "logs": [],
+                "clips_created": 0,
+                "clips": [],
+                "current_step": "Idle",
+                "progress_pct": 0,
+                "output_folder": str(BASE_OUT_DIR),
+                "cleaned_up": False,
+            }
+        target_id = job_id if job_id and job_id in JOBS else max(
+            JOBS.keys(), key=lambda k: JOBS[k].get("created_at", 0.0)
+        )
+        snap = dict(JOBS[target_id])
+        snap["logs"] = list(JOBS[target_id]["logs"])
+        snap["clips"] = list(JOBS[target_id]["clips"])
+        return snap
+
+
+def _job_cache_dir(job_out_folder: Path) -> Path:
+    cache_dir = job_out_folder / ".cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -86,7 +183,7 @@ def verify_gemini_api_key(api_key: str) -> tuple[bool, str]:
             )
             if resp and (resp.text or "").strip():
                 return True, f"Verified! Key is active ({model_name})."
-        except Exception as exc:  # noqa: BLE001 - inspect API error details
+        except Exception as exc:  # noqa: BLE001
             err_str = str(exc)
             last_err = err_str
             low = err_str.lower()
@@ -102,47 +199,33 @@ def verify_gemini_api_key(api_key: str) -> tuple[bool, str]:
     return False, f"Could not verify API key: {last_err[:180] or 'Unknown error'}"
 
 
-def run_clip_worker(form: dict) -> None:
+def run_clip_worker(job_id: str, form: dict) -> None:
     source = str(form.get("source", "")).strip()
     user_api_key = str(form.get("api_key", "")).strip()
     num_clips = str(form.get("num_clips", "6")).strip() or "6"
     min_sec = str(form.get("min_sec", "20")).strip() or "20"
     max_sec = str(form.get("max_sec", "60")).strip() or "60"
     beep_words = bool(form.get("beep_words", True))
-    auto_fx = AUTO_FX_ENABLED
-    topic = AUTO_TOPIC
-    layout = AUTO_LAYOUT
-    focus = AUTO_FOCUS
-
-    raw_folder = str(form.get("output_folder", "")).strip()
-    out_folder = Path(raw_folder).expanduser().resolve() if raw_folder else DEFAULT_CLIPS_DIR.resolve()
+    out_folder = BASE_OUT_DIR / "jobs" / job_id
     out_folder.mkdir(parents=True, exist_ok=True)
-    cache_home = _same_drive_cache_dir(out_folder)
+    cache_home = _job_cache_dir(out_folder)
 
-    set_status(
-        running=True,
-        phase="generating",
-        logs=[],
-        clips_created=0,
-        current_step="Starting...",
-        progress_pct=8,
-        output_folder=str(out_folder),
-    )
+    set_job_status(job_id, running=True, phase="generating", current_step="Starting...", progress_pct=8)
 
     try:
         if not user_api_key:
-            append_log("Error: No Google API Key set. Click the Settings gear icon at the top right to add your key.")
-            set_status(running=False, phase="error", current_step="API key required", progress_pct=0)
+            append_log(job_id, "Error: No Google API Key set.")
+            set_job_status(job_id, running=False, phase="error", current_step="API key required", progress_pct=0)
             return
 
         if not source:
-            append_log("Error: Click Upload to select video files or paste a video URL/path first.")
-            set_status(running=False, phase="error", current_step="Missing input", progress_pct=0)
+            append_log(job_id, "Error: Paste a video/stream URL or click Upload to select a file.")
+            set_job_status(job_id, running=False, phase="error", current_step="Missing input", progress_pct=0)
             return
 
         if not SCRIPT_PATH.exists():
-            append_log(f"Error: Missing {SCRIPT_PATH}")
-            set_status(running=False, phase="error", current_step="Error", progress_pct=0)
+            append_log(job_id, f"Error: Missing {SCRIPT_PATH}")
+            set_job_status(job_id, running=False, phase="error", current_step="Error", progress_pct=0)
             return
 
         cmd = [
@@ -154,11 +237,11 @@ def run_clip_worker(form: dict) -> None:
             "--brain",
             "gemini-api",
             "--topic",
-            topic,
+            AUTO_TOPIC,
             "--clips",
             num_clips,
             "--layout",
-            layout,
+            AUTO_LAYOUT,
             "--min",
             min_sec,
             "--max",
@@ -168,25 +251,22 @@ def run_clip_worker(form: dict) -> None:
             "--fast",
             "--repick",
         ]
-        if source.startswith(("http://", "https://")):
-            cmd += ["--cookies", "firefox"]
-        if focus:
-            cmd += ["--focus", focus]
+        if AUTO_FOCUS:
+            cmd += ["--focus", AUTO_FOCUS]
 
         run_env = os.environ.copy()
         run_env["STREAMCLIPS_NO_ENV_FALLBACK"] = "1"
         run_env["GEMINI_API_KEY"] = user_api_key
         run_env["GOOGLE_API_KEY"] = user_api_key
         run_env["STREAMCLIPS_BLEEP"] = "1" if beep_words else "0"
-        run_env["STREAMCLIPS_AUTO_FX"] = "1" if auto_fx else "0"
+        run_env["STREAMCLIPS_AUTO_FX"] = "1" if AUTO_FX_ENABLED else "0"
         run_env["STREAMCLIPS_OUT_DIR"] = str(out_folder)
         run_env["STREAMCLIPS_HOME"] = str(cache_home)
         run_env["PYTHONIOENCODING"] = "utf-8"
         run_env["PYTHONUTF8"] = "1"
 
-        append_log(f"Output folder: {out_folder}")
-        append_log(f"Download & cache folder: {cache_home}")
-        append_log(f"Starting job ({num_clips} clips, {min_sec}s-{max_sec}s)...")
+        append_log(job_id, f"Job ID: {job_id}")
+        append_log(job_id, f"Starting job ({num_clips} clips, {min_sec}s-{max_sec}s)...")
 
         proc = subprocess.Popen(
             cmd,
@@ -204,80 +284,117 @@ def run_clip_worker(form: dict) -> None:
             clean = line.rstrip()
             if not clean:
                 continue
-            append_log(clean)
+            append_log(job_id, clean)
             low = clean.lower()
             if "downloading" in low or "audio" in low:
-                set_status(current_step="Downloading...", progress_pct=25)
+                set_job_status(job_id, current_step="Downloading...", progress_pct=25)
             elif "listening" in low or "heard " in low or "whisper" in low:
-                set_status(current_step="Transcribing...", progress_pct=50)
+                set_job_status(job_id, current_step="Transcribing...", progress_pct=50)
             elif "picking" in low or "picked " in low:
-                set_status(current_step="Selecting moments...", progress_pct=72)
+                set_job_status(job_id, current_step="Selecting moments...", progress_pct=72)
             elif "clip " in low and "saved " in low:
-                with STATE_LOCK:
-                    JOB_STATE["clips_created"] += 1
-                set_status(current_step="Rendering clips...", progress_pct=88)
+                _refresh_job_clips(job_id, out_folder)
+                set_job_status(job_id, current_step="Rendering clips...", progress_pct=88)
 
         rc = proc.wait()
-        mp4_count = len(list(out_folder.glob("*.mp4")))
-        txt_count = len(list(out_folder.glob("*.txt")))
+        clips = _refresh_job_clips(job_id, out_folder)
 
         if rc == 0:
-            append_log(f"Done: {mp4_count} .mp4 and {txt_count} .txt in {out_folder}")
-            set_status(
+            append_log(job_id, f"Done: {len(clips)} clip(s) ready to download.")
+            set_job_status(
+                job_id,
                 running=False,
                 phase="completed",
                 current_step="Completed",
                 progress_pct=100,
-                clips_created=mp4_count,
+                finished_at=time.time(),
             )
+            _schedule_cleanup(job_id, out_folder)
         else:
-            append_log(f"Exited with code {rc}.")
-            set_status(running=False, phase="error", current_step="Error", progress_pct=0)
+            append_log(job_id, f"Exited with code {rc}.")
+            set_job_status(
+                job_id,
+                running=False,
+                phase="error",
+                current_step="Error",
+                progress_pct=0,
+                finished_at=time.time(),
+            )
+            _schedule_cleanup(job_id, out_folder, delay_sec=600)
 
-    except Exception as err:  # noqa: BLE001 - surface worker errors cleanly to UI logs
-        append_log(f"Error: {err}")
-        set_status(running=False, phase="error", current_step="Error", progress_pct=0)
+    except Exception as err:  # noqa: BLE001
+        append_log(job_id, f"Error: {err}")
+        set_job_status(
+            job_id,
+            running=False,
+            phase="error",
+            current_step="Error",
+            progress_pct=0,
+            finished_at=time.time(),
+        )
+        _schedule_cleanup(job_id, out_folder, delay_sec=600)
 
 
-def run_upload_worker(form: dict, video_paths: list[str], music_path: str | None, temp_folder: Path) -> None:
+def run_upload_worker(
+    job_id: str,
+    form: dict,
+    video_paths: list[str],
+    music_path: str | None,
+    upload_temp_folder: Path,
+) -> None:
     """Process uploaded local videos using the existing StreamClipper engine."""
+    out_folder = BASE_OUT_DIR / "jobs" / job_id
+    out_folder.mkdir(parents=True, exist_ok=True)
     try:
         from scripts.upload_processor import process_uploads
 
-        output_folder = str(form.get("output_folder", "")).strip() or str(DEFAULT_CLIPS_DIR)
-        set_status(
+        set_job_status(
+            job_id,
             running=True,
             phase="generating",
-            logs=[],
-            clips_created=0,
             current_step="Preparing uploaded videos...",
             progress_pct=5,
-            output_folder=output_folder,
         )
+        append_log(job_id, f"Job ID: {job_id}")
+
         count = process_uploads(
             video_paths=video_paths,
             music_path=music_path,
-            output_folder=output_folder,
+            output_folder=str(out_folder),
             api_key=str(form.get("api_key", "")).strip(),
             num_clips=int(form.get("num_clips", 6)),
             min_sec=int(form.get("min_sec", 20)),
             max_sec=int(form.get("max_sec", 60)),
             beep_words=str(form.get("beep_words", "true")).lower() == "true",
-            log=append_log,
-            status=set_status,
+            log=lambda msg: append_log(job_id, msg),
+            status=lambda **kw: set_job_status(job_id, **kw),
         )
-        set_status(
+        clips = _refresh_job_clips(job_id, out_folder)
+        final_count = len(clips) if clips else count
+        append_log(job_id, f"Complete: {final_count} clip(s) ready to download.")
+        set_job_status(
+            job_id,
             running=False,
             phase="completed",
             current_step="Completed",
             progress_pct=100,
-            clips_created=count,
+            clips_created=final_count,
+            finished_at=time.time(),
         )
+        _schedule_cleanup(job_id, out_folder)
     except Exception as exc:  # noqa: BLE001
-        append_log(f"Upload error: {exc}")
-        set_status(running=False, phase="error", current_step="Upload failed", progress_pct=0)
+        append_log(job_id, f"Upload error: {exc}")
+        set_job_status(
+            job_id,
+            running=False,
+            phase="error",
+            current_step="Upload failed",
+            progress_pct=0,
+            finished_at=time.time(),
+        )
+        _schedule_cleanup(job_id, out_folder, delay_sec=600)
     finally:
-        shutil.rmtree(temp_folder, ignore_errors=True)
+        shutil.rmtree(upload_temp_folder, ignore_errors=True)
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -307,7 +424,7 @@ HTML_PAGE = """<!DOCTYPE html>
     font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     color: var(--text);
     min-height: 100vh;
-    padding: 28px 18px 68px;
+    padding: 24px 16px 68px;
     position: relative;
     overflow-x: hidden;
     background:
@@ -317,7 +434,6 @@ HTML_PAGE = """<!DOCTYPE html>
       linear-gradient(170deg, #050510 0%, #070718 52%, #04081a 100%);
   }
 
-  /* Subtle, dimmed edge waves keeping the center dark */
   .wave-layer {
     position: fixed;
     inset: -12%;
@@ -367,13 +483,13 @@ HTML_PAGE = """<!DOCTYPE html>
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 16px;
+    gap: 14px;
     flex-wrap: wrap;
     background: var(--card-bg);
     backdrop-filter: blur(18px);
     border: 1px solid var(--border-soft);
     border-radius: 22px;
-    padding: 16px 22px;
+    padding: 16px 20px;
     box-shadow: 0 18px 42px rgba(2, 3, 12, 0.72), 0 0 14px rgba(124, 58, 237, 0.07);
   }
 
@@ -397,7 +513,7 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   .brand h1 {
-    font-size: 1.18rem;
+    font-size: 1.15rem;
     font-weight: 700;
     letter-spacing: -0.015em;
   }
@@ -406,13 +522,14 @@ HTML_PAGE = """<!DOCTYPE html>
     display: inline-flex;
     align-items: center;
     gap: 10px;
+    flex-wrap: wrap;
   }
 
   .status-pill {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 7px 15px;
+    padding: 7px 14px;
     border-radius: 999px;
     font-size: 0.8rem;
     font-weight: 600;
@@ -431,7 +548,6 @@ HTML_PAGE = """<!DOCTYPE html>
   .status-pill.running {
     color: #bae6fd;
     border-color: rgba(56, 189, 248, 0.42);
-    box-shadow: 0 0 8px rgba(56, 189, 248, 0.14);
   }
   .status-pill.running .status-dot { background: #38bdf8; }
 
@@ -451,7 +567,7 @@ HTML_PAGE = """<!DOCTYPE html>
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    height: 36px;
+    min-height: 38px;
     padding: 0 14px;
     border-radius: 999px;
     background: rgba(7, 9, 24, 0.88);
@@ -460,14 +576,6 @@ HTML_PAGE = """<!DOCTYPE html>
     font-size: 0.8rem;
     font-weight: 600;
     cursor: pointer;
-    box-shadow: 0 0 8px rgba(124, 58, 237, 0.10);
-    transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.12s ease;
-  }
-
-  .settings-btn:hover {
-    border-color: rgba(56, 189, 248, 0.55);
-    box-shadow: 0 0 10px rgba(56, 189, 248, 0.18);
-    transform: translateY(-1px);
   }
 
   .key-dot {
@@ -479,7 +587,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
   .key-dot.ready {
     background: var(--ok);
-    box-shadow: 0 0 5px rgba(52, 211, 153, 0.55);
   }
 
   .card {
@@ -487,7 +594,7 @@ HTML_PAGE = """<!DOCTYPE html>
     backdrop-filter: blur(18px);
     border: 1px solid var(--border-soft);
     border-radius: 22px;
-    padding: 22px;
+    padding: 20px;
     box-shadow: 0 18px 42px rgba(2, 3, 12, 0.72), 0 0 14px rgba(124, 58, 237, 0.06);
   }
 
@@ -497,22 +604,13 @@ HTML_PAGE = """<!DOCTYPE html>
     justify-content: space-between;
     gap: 12px;
     margin-bottom: 16px;
+    flex-wrap: wrap;
   }
 
   .card-title {
     font-size: 0.96rem;
     font-weight: 700;
     color: #f8fafc;
-  }
-
-  .form-grid {
-    display: grid;
-    grid-template-columns: 1.5fr 1fr;
-    gap: 14px;
-  }
-
-  @media (max-width: 760px) {
-    .form-grid { grid-template-columns: 1fr; }
   }
 
   .field label {
@@ -530,19 +628,11 @@ HTML_PAGE = """<!DOCTYPE html>
     border: 1px solid rgba(139, 92, 246, 0.28);
     color: var(--text);
     border-radius: 14px;
-    padding: 11px 14px;
-    font-size: 0.9rem;
+    padding: 12px 14px;
+    font-size: 0.92rem;
     outline: none;
-    transition: border-color 0.18s ease, box-shadow 0.18s ease;
   }
 
-  input[type="text"]:focus,
-  input[type="password"]:focus {
-    border-color: rgba(56, 189, 248, 0.55);
-    box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.12), 0 0 10px rgba(124, 58, 237, 0.16);
-  }
-
-  /* Master "Upload" toggle row */
   .upload-launch-row {
     margin-top: 14px;
     display: flex;
@@ -552,7 +642,6 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-wrap: wrap;
   }
 
-  /* Pill upload bar & status cards (hidden until "Upload" is clicked) */
   .media-bar {
     display: none;
     margin-top: 12px;
@@ -586,23 +675,15 @@ HTML_PAGE = """<!DOCTYPE html>
     display: inline-flex;
     align-items: center;
     gap: 8px;
+    min-height: 40px;
     padding: 8px 16px;
     border-radius: 999px;
     background: rgba(9, 12, 30, 0.92);
     border: 1px solid rgba(139, 92, 246, 0.38);
     color: #e2e8f0;
-    font-size: 0.83rem;
+    font-size: 0.84rem;
     font-weight: 600;
     cursor: pointer;
-    box-shadow: 0 0 8px rgba(124, 58, 237, 0.10);
-    transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.12s ease, background 0.16s ease;
-  }
-
-  .pill-action:hover {
-    border-color: rgba(56, 189, 248, 0.62);
-    background: rgba(14, 20, 46, 0.96);
-    box-shadow: 0 0 10px rgba(56, 189, 248, 0.18);
-    transform: translateY(-1px);
   }
 
   .pill-action.active {
@@ -658,7 +739,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .file-list {
     display: grid;
     gap: 6px;
-    max-height: 112px;
+    max-height: 120px;
     overflow-y: auto;
   }
 
@@ -668,7 +749,7 @@ HTML_PAGE = """<!DOCTYPE html>
     justify-content: space-between;
     gap: 8px;
     font-size: 0.78rem;
-    padding: 5px 8px;
+    padding: 6px 8px;
     border-radius: 10px;
     background: rgba(5, 7, 19, 0.82);
     border: 1px solid rgba(139, 92, 246, 0.14);
@@ -710,10 +791,8 @@ HTML_PAGE = """<!DOCTYPE html>
   .empty-note {
     font-size: 0.77rem;
     color: var(--muted);
-    padding: 2px 0;
   }
 
-  /* Dimmed, softer purple-to-blue border pill stepper bar */
   .neon-stepper-bar {
     margin-top: 16px;
     display: grid;
@@ -722,13 +801,7 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 22px;
     padding: 14px 8px;
     background: rgba(6, 8, 22, 0.78);
-    border: 1px solid transparent;
-    background-clip: padding-box;
     position: relative;
-    box-shadow:
-      0 0 12px rgba(124, 58, 237, 0.10),
-      0 0 14px rgba(14, 165, 233, 0.08),
-      inset 0 0 14px rgba(5, 6, 18, 0.85);
   }
 
   .neon-stepper-bar::before {
@@ -761,18 +834,6 @@ HTML_PAGE = """<!DOCTYPE html>
     position: relative;
   }
 
-  @media (min-width: 821px) {
-    .stepper-cell:not(:last-child)::after {
-      content: "";
-      position: absolute;
-      right: 0;
-      top: 12%;
-      bottom: 12%;
-      width: 1px;
-      background: linear-gradient(180deg, transparent, rgba(139, 92, 246, 0.28), transparent);
-    }
-  }
-
   .stepper-heading {
     display: inline-flex;
     align-items: center;
@@ -780,20 +841,7 @@ HTML_PAGE = """<!DOCTYPE html>
     font-size: 0.92rem;
     font-weight: 700;
     color: #f1f5f9;
-    letter-spacing: -0.01em;
   }
-
-  .stepper-icon {
-    width: 18px;
-    height: 18px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    color: rgba(217, 70, 239, 0.82);
-  }
-
-  .stepper-cell:nth-child(2) .stepper-icon { color: rgba(56, 189, 248, 0.82); }
-  .stepper-cell:nth-child(3) .stepper-icon { color: rgba(168, 85, 247, 0.85); }
 
   .pill-track {
     width: 100%;
@@ -802,9 +850,6 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 999px;
     background: rgba(5, 7, 19, 0.92);
     border: 1px solid rgba(139, 92, 246, 0.36);
-    box-shadow:
-      0 0 8px rgba(124, 58, 237, 0.10),
-      inset 0 0 10px rgba(3, 5, 14, 0.9);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -820,35 +865,16 @@ HTML_PAGE = """<!DOCTYPE html>
     color: #f1f5f9;
     font-size: 1.2rem;
     font-weight: 600;
-    line-height: 1;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    box-shadow: 0 0 6px rgba(168, 85, 247, 0.14);
-    transition: transform 0.1s ease, box-shadow 0.16s ease, border-color 0.16s ease;
     user-select: none;
   }
 
   .pill-btn.plus-btn {
     border-color: rgba(56, 189, 248, 0.46);
     background: rgba(9, 22, 44, 0.78);
-    box-shadow: 0 0 6px rgba(56, 189, 248, 0.14);
-  }
-
-  .pill-btn:hover {
-    transform: scale(1.03);
-    border-color: rgba(192, 132, 252, 0.7);
-    box-shadow: 0 0 9px rgba(168, 85, 247, 0.25);
-  }
-
-  .pill-btn.plus-btn:hover {
-    border-color: rgba(56, 189, 248, 0.75);
-    box-shadow: 0 0 9px rgba(56, 189, 248, 0.26);
-  }
-
-  .pill-btn:active {
-    transform: scale(0.95);
   }
 
   .pill-val {
@@ -908,17 +934,16 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--muted);
     font-size: 0.82rem;
     font-weight: 700;
+    min-height: 34px;
     padding: 6px 16px;
     border-radius: 999px;
     cursor: pointer;
-    transition: all 0.15s ease;
   }
 
   .yn-btn.active {
     color: #ffffff;
     background: linear-gradient(135deg, rgba(124, 58, 237, 0.36), rgba(14, 165, 233, 0.28));
     border-color: rgba(168, 85, 247, 0.48);
-    box-shadow: 0 0 7px rgba(124, 58, 237, 0.16);
   }
 
   .btn {
@@ -926,23 +951,21 @@ HTML_PAGE = """<!DOCTYPE html>
     color: #ffffff;
     border: 1px solid rgba(255, 255, 255, 0.18);
     border-radius: 999px;
-    padding: 11px 24px;
+    min-height: 42px;
+    padding: 10px 22px;
     font-size: 0.88rem;
     font-weight: 700;
     cursor: pointer;
-    box-shadow: 0 0 12px rgba(124, 58, 237, 0.22);
-    transition: transform 0.14s ease, box-shadow 0.16s ease, opacity 0.16s ease;
-  }
-
-  .btn:hover:not(:disabled) {
-    transform: translateY(-1px);
-    box-shadow: 0 0 16px rgba(14, 165, 233, 0.28);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
   }
 
   .btn:disabled {
     opacity: 0.45;
     cursor: not-allowed;
-    box-shadow: none;
   }
 
   .btn-ghost {
@@ -950,15 +973,11 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--muted);
     border: 1px solid var(--border-soft);
     border-radius: 999px;
+    min-height: 34px;
     padding: 6px 14px;
     font-size: 0.78rem;
     font-weight: 600;
     cursor: pointer;
-  }
-
-  .btn-ghost:hover {
-    color: #ffffff;
-    border-color: rgba(56, 189, 248, 0.5);
   }
 
   .stats-grid {
@@ -987,7 +1006,7 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   .stat-val {
-    font-size: 1rem;
+    font-size: 0.96rem;
     font-weight: 700;
     margin-top: 4px;
     white-space: nowrap;
@@ -1012,21 +1031,59 @@ HTML_PAGE = """<!DOCTYPE html>
     transition: width 0.25s ease;
   }
 
+  .clips-panel {
+    margin-bottom: 14px;
+    display: grid;
+    gap: 8px;
+  }
+
+  .clip-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+    border-radius: 14px;
+    background: rgba(6, 9, 24, 0.88);
+    border: 1px solid rgba(52, 211, 153, 0.28);
+  }
+
+  .clip-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .clip-title {
+    font-size: 0.86rem;
+    font-weight: 700;
+    color: #f8fafc;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .clip-sub {
+    font-size: 0.74rem;
+    color: var(--muted);
+  }
+
   pre.console {
     background: rgba(3, 4, 14, 0.92);
     border: 1px solid var(--border-soft);
     border-radius: 16px;
     padding: 14px 16px;
-    height: 270px;
+    height: 240px;
     overflow-y: auto;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 0.8rem;
-    line-height: 1.6;
+    line-height: 1.55;
     color: #cbd5e1;
     white-space: pre-wrap;
   }
 
-  /* Settings Modal */
   .modal-backdrop {
     position: fixed;
     inset: 0;
@@ -1050,7 +1107,6 @@ HTML_PAGE = """<!DOCTYPE html>
     border: 1px solid rgba(139, 92, 246, 0.42);
     border-radius: 22px;
     padding: 22px 24px;
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.8), 0 0 18px rgba(124, 58, 237, 0.16);
   }
 
   .modal-head {
@@ -1089,7 +1145,6 @@ HTML_PAGE = """<!DOCTYPE html>
     gap: 10px;
   }
 
-  /* Fixed bottom-right animated signature badge ("Jineesh") */
   .signature-badge {
     position: fixed;
     right: 16px;
@@ -1106,7 +1161,6 @@ HTML_PAGE = """<!DOCTYPE html>
     background: rgba(7, 8, 24, 0.78);
     backdrop-filter: blur(12px);
     border: 1px solid rgba(139, 92, 246, 0.30);
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55), 0 0 10px rgba(124, 58, 237, 0.10);
   }
 
   .sig-word {
@@ -1124,7 +1178,6 @@ HTML_PAGE = """<!DOCTYPE html>
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
-    text-shadow: 0 0 8px rgba(139, 92, 246, 0.22);
     animation: sigWave 2.8s ease-in-out infinite;
   }
 
@@ -1137,18 +1190,9 @@ HTML_PAGE = """<!DOCTYPE html>
   .sig-letter:nth-child(7) { animation-delay: 0.72s; }
 
   @keyframes sigWave {
-    0%, 100% {
-      transform: translateY(0px);
-      opacity: 0.86;
-    }
-    35% {
-      transform: translateY(-3.5px);
-      opacity: 1;
-    }
-    70% {
-      transform: translateY(0.5px);
-      opacity: 0.9;
-    }
+    0%, 100% { transform: translateY(0px); opacity: 0.86; }
+    35% { transform: translateY(-3.5px); opacity: 1; }
+    70% { transform: translateY(0.5px); opacity: 0.9; }
   }
 </style>
 </head>
@@ -1176,10 +1220,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <button type="button" class="settings-btn" onclick="openSettings()" title="API Key Settings" aria-label="Settings">
         <span id="keyDot" class="key-dot"></span>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="3"/>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.42 1.15.19.04.39.06.58.06H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
-        </svg>
         <span id="keyLabel">API Key</span>
       </button>
     </div>
@@ -1190,15 +1230,9 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="card-title">New Clip Job</div>
     </div>
 
-    <div class="form-grid">
-      <div class="field">
-        <label for="sourceInput">Video / Stream URL or File Path</label>
-        <input id="sourceInput" type="text" placeholder="https://www.youtube.com/watch?v=..." />
-      </div>
-      <div class="field">
-        <label for="folderInput">Output Folder</label>
-        <input id="folderInput" type="text" value="C:\\Users\\tadvi\\StreamClips" />
-      </div>
+    <div class="field">
+      <label for="sourceInput">Video / Stream URL</label>
+      <input id="sourceInput" type="text" placeholder="https://www.youtube.com/watch?v=..." />
     </div>
 
     <input id="videoFiles" type="file" accept=".mp4,.mkv,.mov,.avi,.webm,.m4v,.wmv,video/*" multiple style="display:none;" onchange="handleFileSelection('video')" />
@@ -1206,9 +1240,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="upload-launch-row">
       <button type="button" class="pill-action" id="uploadToggleBtn" onclick="toggleUploadPanel()" aria-expanded="false">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/>
-        </svg>
         <span>Upload</span>
       </button>
       <span class="media-summary" id="closedMediaBadge"></span>
@@ -1218,22 +1249,13 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="media-toolbar">
         <div class="pill-group">
           <button type="button" class="pill-action" id="pickVideoBtn" onclick="document.getElementById('videoFiles').click()">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/>
-            </svg>
             <span>Upload video</span>
           </button>
-
           <button type="button" class="pill-action" id="pickMusicBtn" onclick="document.getElementById('musicFile').click()">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
-            </svg>
             <span>Upload music</span>
           </button>
-
           <button type="button" class="btn-ghost" id="clearMediaBtn" onclick="clearSelectedMedia()" style="display:none;">Clear files</button>
         </div>
-
         <div class="media-summary" id="mediaSummary">Paste a link or upload video file(s)</div>
       </div>
 
@@ -1263,29 +1285,17 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="neon-stepper-bar">
       <div class="stepper-cell">
         <div class="stepper-heading">
-          <span class="stepper-icon" aria-hidden="true">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 11v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/>
-              <path d="M4 11 2 6l16-3 2 5-16 3Z"/>
-              <path d="m7 5 2 5"/><path d="m13 4 2 5"/>
-            </svg>
-          </span>
           <label for="numClipsInput" style="margin:0;color:inherit;font-size:inherit;font-weight:inherit;cursor:pointer;">Clips</label>
         </div>
         <div class="pill-track">
           <button type="button" class="pill-btn" aria-label="Decrease clips" onclick="stepField('numClipsInput', -1)">&minus;</button>
-          <input id="numClipsInput" class="pill-val" type="number" value="6" min="1" max="30" onchange="syncBounds()" />
+          <input id="numClipsInput" class="pill-val" type="number" value="4" min="1" max="20" onchange="syncBounds()" />
           <button type="button" class="pill-btn plus-btn" aria-label="Increase clips" onclick="stepField('numClipsInput', 1)">+</button>
         </div>
       </div>
 
       <div class="stepper-cell">
         <div class="stepper-heading">
-          <span class="stepper-icon" aria-hidden="true">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M10 2h4"/>
-            </svg>
-          </span>
           <label for="minSecInput" style="margin:0;color:inherit;font-size:inherit;font-weight:inherit;cursor:pointer;">Min Seconds</label>
         </div>
         <div class="pill-track">
@@ -1297,11 +1307,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div class="stepper-cell">
         <div class="stepper-heading">
-          <span class="stepper-icon" aria-hidden="true">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M13 2 4 14h7l-1 8 10-12h-7l0-8Z"/>
-            </svg>
-          </span>
           <label for="maxSecInput" style="margin:0;color:inherit;font-size:inherit;font-weight:inherit;cursor:pointer;">Max Seconds</label>
         </div>
         <div class="pill-track">
@@ -1326,8 +1331,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <section class="card">
     <div class="card-head">
-      <div class="card-title">Logs</div>
-      <button class="btn-ghost" type="button" onclick="clearConsole()">Clear</button>
+      <div class="card-title">Clips &amp; Logs</div>
+      <button class="btn-ghost" type="button" onclick="clearConsole()">Clear Logs</button>
     </div>
 
     <div class="stats-grid">
@@ -1336,12 +1341,12 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="stat-val" id="stepVal">Idle</div>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Clips</div>
+        <div class="stat-label">Clips Ready</div>
         <div class="stat-val" id="countVal" style="color: var(--ok);">0</div>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Folder</div>
-        <div class="stat-val" id="folderVal" style="color: #cbd5e1; font-size: 0.88rem;">C:\\Users\\tadvi\\StreamClips</div>
+        <div class="stat-label">Job ID</div>
+        <div class="stat-val" id="jobIdVal" style="color: #cbd5e1; font-size: 0.86rem;">None</div>
       </div>
     </div>
 
@@ -1349,18 +1354,18 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="progress-bar" id="progFill"></div>
     </div>
 
+    <div class="clips-panel" id="clipsList"></div>
+
     <pre class="console" id="logBox">Ready.</pre>
   </section>
 </div>
 
-<!-- Fixed bottom-right animated signature -->
 <div class="signature-badge" aria-label="Jineesh">
   <span class="sig-word" aria-hidden="true">
     <span class="sig-letter">J</span><span class="sig-letter">i</span><span class="sig-letter">n</span><span class="sig-letter">e</span><span class="sig-letter">e</span><span class="sig-letter">s</span><span class="sig-letter">h</span>
   </span>
 </div>
 
-<!-- Google API Key Settings Modal -->
 <div id="settingsModal" class="modal-backdrop" onclick="if(event.target===this) closeSettings()">
   <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
     <div class="modal-head">
@@ -1387,6 +1392,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 <script>
 const STORAGE_KEY = "streamclipper_user_gemini_api_key";
+const JOB_STORAGE_KEY = "streamclipper_active_job_id";
 const VIDEO_EXTS = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv"];
 const MUSIC_EXTS = [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"];
 
@@ -1394,6 +1400,19 @@ let muteProfanity = true;
 let localClearedAt = 0;
 let videoEntries = [];
 let musicEntry = null;
+let activeJobId = "";
+
+try {
+  activeJobId = (sessionStorage.getItem(JOB_STORAGE_KEY) || "").trim();
+} catch (_) {}
+
+function setActiveJobId(jid) {
+  activeJobId = (jid || "").trim();
+  try {
+    if (activeJobId) sessionStorage.setItem(JOB_STORAGE_KEY, activeJobId);
+    else sessionStorage.removeItem(JOB_STORAGE_KEY);
+  } catch (_) {}
+}
 
 function toggleUploadPanel(forceOpen = null) {
   const bar = document.getElementById("mediaBar");
@@ -1694,6 +1713,25 @@ function updateBadge(phase, running) {
   }
 }
 
+function renderClips(clips, cleanedUp) {
+  const wrap = document.getElementById("clipsList");
+  if (!clips || !clips.length) {
+    wrap.innerHTML = cleanedUp
+      ? '<div class="empty-note">Temporary server files were cleaned up for this job.</div>'
+      : "";
+    return;
+  }
+  wrap.innerHTML = clips.map((c) => `
+    <div class="clip-row">
+      <div class="clip-meta">
+        <span class="clip-title" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>
+        <span class="clip-sub">${escapeHtml(String(c.size_mb ?? 0))} MB</span>
+      </div>
+      <a class="btn" href="${escapeHtml(c.url)}" download="${escapeHtml(c.name)}">Download</a>
+    </div>
+  `).join("");
+}
+
 async function startPipeline() {
   const apiKey = getSavedApiKey();
   if (!apiKey) {
@@ -1724,7 +1762,6 @@ async function startPipeline() {
     form.append("num_clips", document.getElementById("numClipsInput").value);
     form.append("min_sec", document.getElementById("minSecInput").value);
     form.append("max_sec", document.getElementById("maxSecInput").value);
-    form.append("output_folder", document.getElementById("folderInput").value);
     form.append("beep_words", String(muteProfanity));
 
     try {
@@ -1735,13 +1772,14 @@ async function startPipeline() {
         startBtn.disabled = false;
         alert(data.error || "Upload failed.");
       } else {
+        if (data.job_id) setActiveJobId(data.job_id);
         setMediaUploadStatus("uploaded", "Uploaded");
-        document.getElementById("logBox").textContent = "Upload verified. Starting clip generation...";
+        document.getElementById("logBox").textContent = "Upload verified. Starting clip job...";
       }
     } catch (_) {
       setMediaUploadStatus("bad", "Upload failed");
       startBtn.disabled = false;
-      alert("Upload failed. Check that StreamClipper is running and try again.");
+      alert("Upload failed. Check your connection and try again.");
     } finally {
       startBtn.textContent = prevText;
     }
@@ -1753,7 +1791,6 @@ async function startPipeline() {
     num_clips: document.getElementById("numClipsInput").value,
     min_sec: document.getElementById("minSecInput").value,
     max_sec: document.getElementById("maxSecInput").value,
-    output_folder: document.getElementById("folderInput").value,
     beep_words: muteProfanity,
     api_key: apiKey,
   };
@@ -1764,10 +1801,12 @@ async function startPipeline() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       startBtn.disabled = false;
-      const err = await res.json().catch(() => ({}));
-      alert(err.error || "Could not start job.");
+      alert(data.error || "Could not start job.");
+    } else if (data.job_id) {
+      setActiveJobId(data.job_id);
     }
   } catch (_) {
     startBtn.disabled = false;
@@ -1777,8 +1816,13 @@ async function startPipeline() {
 
 async function pollStatus() {
   try {
-    const res = await fetch("/api/status");
+    const q = activeJobId ? `?job_id=${encodeURIComponent(activeJobId)}` : "";
+    const res = await fetch(`/api/status${q}`);
     const s = await res.json();
+
+    if (s.job_id && !activeJobId) {
+      setActiveJobId(s.job_id);
+    }
 
     const busy = !!s.running;
     document.getElementById("startBtn").disabled = busy;
@@ -1786,8 +1830,10 @@ async function pollStatus() {
 
     document.getElementById("stepVal").textContent = s.current_step || (busy ? "Running..." : "Idle");
     document.getElementById("countVal").textContent = s.clips_created ?? 0;
-    document.getElementById("folderVal").textContent = s.output_folder || "";
+    document.getElementById("jobIdVal").textContent = s.job_id || "None";
     document.getElementById("progFill").style.width = `${s.progress_pct ?? 0}%`;
+
+    renderClips(s.clips || [], !!s.cleaned_up);
 
     const logBox = document.getElementById("logBox");
     if (Date.now() - localClearedAt > 1500) {
@@ -1803,7 +1849,7 @@ async function pollStatus() {
 renderMediaState();
 refreshKeyIndicator();
 pollStatus();
-setInterval(pollStatus, 1000);
+setInterval(pollStatus, 1200);
 </script>
 </body>
 </html>
@@ -1822,6 +1868,69 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_clip_download(self, job_id: str, rel_path: str) -> None:
+        clean_id = Path(job_id).name
+        if clean_id != job_id or not clean_id:
+            self._send_json(400, {"error": "Invalid job ID"})
+            return
+
+        job_root = (BASE_OUT_DIR / "jobs" / clean_id).resolve()
+        candidate = (job_root / unquote(rel_path)).resolve()
+
+        if not str(candidate).startswith(str(job_root) + os.sep):
+            self._send_json(403, {"error": "Forbidden"})
+            return
+        if not candidate.is_file() or candidate.suffix.lower() != ".mp4":
+            self._send_json(404, {"error": "Clip not found or expired"})
+            return
+
+        file_size = candidate.stat().st_size
+        range_header = self.headers.get("Range")
+        start = 0
+        end = file_size - 1
+        status_code = 200
+
+        if range_header and range_header.startswith("bytes="):
+            part = range_header[6:].split(",", 1)[0].strip()
+            s_txt, _, e_txt = part.partition("-")
+            try:
+                if s_txt:
+                    start = max(0, int(s_txt))
+                if e_txt:
+                    end = min(file_size - 1, int(e_txt))
+                if not s_txt and e_txt:
+                    suffix_len = min(file_size, int(e_txt))
+                    start = max(0, file_size - suffix_len)
+                    end = file_size - 1
+                if start > end or start >= file_size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+                status_code = 206
+            except ValueError:
+                start, end, status_code = 0, file_size - 1, 200
+
+        content_len = end - start + 1
+        self.send_response(status_code)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(content_len))
+        self.send_header("Content-Disposition", f'attachment; filename="{candidate.name}"')
+        if status_code == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.end_headers()
+
+        with candidate.open("rb") as fh:
+            fh.seek(start)
+            left = content_len
+            while left > 0:
+                chunk = fh.read(min(262144, left))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -1832,10 +1941,16 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
         elif parsed.path == "/api/status":
-            with STATE_LOCK:
-                snapshot = dict(JOB_STATE)
-                snapshot["logs"] = list(JOB_STATE["logs"])
-            self._send_json(200, snapshot)
+            qs = parse_qs(parsed.query)
+            jid = (qs.get("job_id") or [""])[0].strip() or None
+            self._send_json(200, _get_job_snapshot(jid))
+        elif parsed.path.startswith("/api/download/"):
+            rest = parsed.path[len("/api/download/"):]
+            job_id, sep, rel_path = rest.partition("/")
+            if not sep or not rel_path:
+                self._send_json(400, {"error": "Invalid download path"})
+                return
+            self._serve_clip_download(job_id, rel_path)
         else:
             self._send_json(404, {"error": "Not found"})
 
@@ -1844,16 +1959,17 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/upload":
             length = int(self.headers.get("Content-Length", "0"))
-            max_upload = 20 * 1024 * 1024 * 1024
+            max_upload = 2 * 1024 * 1024 * 1024  # 2 GB cap per request
             if length <= 0 or length > max_upload:
-                self._send_json(400, {"error": "Upload is empty or exceeds the 20 GB limit."})
+                self._send_json(400, {"error": "Upload is empty or exceeds the 2 GB limit."})
                 return
             content_type = self.headers.get("Content-Type", "")
             if "multipart/form-data" not in content_type.lower():
                 self._send_json(400, {"error": "Please use the upload form to select files."})
                 return
 
-            temp_folder = DEFAULT_CLIPS_DIR / ".uploads" / uuid.uuid4().hex
+            job_id = uuid.uuid4().hex[:12]
+            temp_folder = BASE_OUT_DIR / ".uploads" / job_id
             spool_path = temp_folder / "multipart_payload.bin"
             try:
                 temp_folder.mkdir(parents=True, exist_ok=True)
@@ -1861,7 +1977,7 @@ class Handler(BaseHTTPRequestHandler):
                 with spool_path.open("wb") as out_f:
                     out_f.write(b"Content-Type: " + content_type.encode("utf-8") + b"\r\nMIME-Version: 1.0\r\n\r\n")
                     while remaining > 0:
-                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        chunk = self.rfile.read(min(1048576, remaining))
                         if not chunk:
                             break
                         out_f.write(chunk)
@@ -1911,17 +2027,15 @@ class Handler(BaseHTTPRequestHandler):
                     shutil.rmtree(temp_folder, ignore_errors=True)
                     self._send_json(400, {"error": "Clip duration settings are invalid."})
                     return
-                with STATE_LOCK:
-                    if JOB_STATE["running"]:
-                        shutil.rmtree(temp_folder, ignore_errors=True)
-                        self._send_json(409, {"error": "Another clipping job is already running."})
-                        return
+
+                job_out = BASE_OUT_DIR / "jobs" / job_id
+                _register_job(job_id, job_out)
                 threading.Thread(
                     target=run_upload_worker,
-                    args=(fields, video_paths, music_path, temp_folder),
+                    args=(job_id, fields, video_paths, music_path, temp_folder),
                     daemon=True,
                 ).start()
-                self._send_json(200, {"started": True, "videos": len(video_paths), "music_added": bool(music_path)})
+                self._send_json(200, {"started": True, "job_id": job_id, "videos": len(video_paths), "music_added": bool(music_path)})
             except Exception as exc:  # noqa: BLE001
                 spool_path.unlink(missing_ok=True)
                 shutil.rmtree(temp_folder, ignore_errors=True)
@@ -1943,19 +2057,18 @@ class Handler(BaseHTTPRequestHandler):
             if not str(data.get("api_key", "")).strip():
                 self._send_json(400, {"error": "Please set your Google API Key in Settings first."})
                 return
-            with STATE_LOCK:
-                if JOB_STATE["running"]:
-                    self._send_json(409, {"error": "Pipeline is already running."})
-                    return
-            threading.Thread(target=run_clip_worker, args=(data,), daemon=True).start()
-            self._send_json(200, {"started": True})
+            job_id = uuid.uuid4().hex[:12]
+            job_out = BASE_OUT_DIR / "jobs" / job_id
+            _register_job(job_id, job_out)
+            threading.Thread(target=run_clip_worker, args=(job_id, data), daemon=True).start()
+            self._send_json(200, {"started": True, "job_id": job_id})
         else:
             self._send_json(404, {"error": "Not found"})
 
 
 def main() -> int:
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"StreamClipper Studio running at http://127.0.0.1:{PORT}")
+    print(f"StreamClipper Studio running at http://{HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
